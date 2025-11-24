@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""
+ifxss - Fast XSS Fuzzer with Clean Output
+Uses precise, per-character requests to highlight unfiltered characters.
+Usage: echo "https://site.com/search?q=FUZZ" | python3 ifxss.py
+       cat urls.txt | python3 ifxss.py -H "Cookie: session=abc123"
+"""
+
+import sys
+import argparse
+import re
+import requests
+from urllib.parse import urlparse, parse_qs, unquote
+
+# ANSI color codes
+class Colors:
+    RED = '\033[91m'      # Dangerous chars
+    YELLOW = '\033[93m'   # Medium risk chars
+    GREEN = '\033[92m'    # Info
+    RESET = '\033[0m'     # Reset color
+    BOLD = '\033[1m'      # Bold text
+
+# Marker to identify injection point
+MARKER = "FUZZ"
+
+# All special characters to test
+TEST_CHARS = ['<', '>', '"', "'", '${', '`', ';']
+
+# Dangerous characters (will be colored RED)
+DANGEROUS_CHARS = ['<', '>', '"', "'"]
+
+# Medium risk characters (will be colored YELLOW)
+MEDIUM_RISK_CHARS = ['${', '`',';']
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='Fast XSS fuzzer with clean colored output'
+    )
+    parser.add_argument('-H', '--header', action='append', dest='headers', 
+                        help='Custom header (can be used multiple times)')
+    parser.add_argument('-t', '--timeout', type=int, default=10,
+                        help='Request timeout in seconds (default: 10)')
+    parser.add_argument('-m', '--marker', type=str, default='FUZZ',
+                        help='Marker string (default: FUZZ)')
+    parser.add_argument('--no-color', action='store_true',
+                        help='Disable colored output')
+    return parser.parse_args()
+
+def parse_headers(header_list):
+    """Convert list of 'Key: Value' strings to dict"""
+    headers = {}
+    if header_list:
+        for h in header_list:
+            if ':' in h:
+                key, value = h.split(':', 1)
+                headers[key.strip()] = value.strip()
+    return headers
+
+def extract_param_name(url, marker):
+    """Extract parameter name that contains the marker"""
+    try:
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
+        for param, values in params.items():
+            if any(marker in str(v) for v in values):
+                return param
+        return "unknown"
+    except:
+        return "unknown"
+
+def colorize_char(char, use_color):
+    """Apply color to character based on risk level"""
+    if not use_color:
+        return char
+    
+    if char in DANGEROUS_CHARS:
+        return f"{Colors.RED}{char}{Colors.RESET}"
+    elif char in MEDIUM_RISK_CHARS:
+        return f"{Colors.YELLOW}{char}{Colors.RESET}"
+    else:
+        return char
+
+def build_test_url(base_url, marker, payload):
+    """Replace marker in URL with payload."""
+    return base_url.replace(marker, payload)
+
+
+def was_char_reflected(response_text, token, char):
+    """
+    Check if token immediately precedes the raw character (optionally separated by whitespace).
+    A short gap helps avoid false positives caused by templating whitespace.
+    """
+    pattern = re.escape(token) + r'\s{0,2}' + re.escape(char)
+    return re.search(pattern, response_text) is not None
+
+
+def send_request(session, url, headers, timeout):
+    """Send GET request and return response."""
+    return session.get(
+        url,
+        headers=headers,
+        timeout=timeout,
+        allow_redirects=True,
+        verify=True,
+    )
+
+
+def categorize_risk(chars):
+    """Return textual risk level for the list of reflected chars."""
+    if any(char in DANGEROUS_CHARS for char in chars):
+        return "HIGH"
+    if any(char in MEDIUM_RISK_CHARS for char in chars):
+        return "MEDIUM"
+    return "LOW"
+
+
+def colorize_risk_label(risk, use_color):
+    """Colorize risk label for pretty output."""
+    if not use_color:
+        return risk
+    if risk == "HIGH":
+        return f"{Colors.RED}{risk}{Colors.RESET}"
+    if risk == "MEDIUM":
+        return f"{Colors.YELLOW}{risk}{Colors.RESET}"
+    return f"{Colors.GREEN}{risk}{Colors.RESET}"
+
+
+def fuzz_url(base_url, marker, headers, timeout, session):
+    """Fuzz URL and return findings."""
+    if marker not in base_url:
+        print(f"[!] No {marker} keyword found in: {base_url}", file=sys.stderr)
+        return None
+    
+    try:
+        # Baseline reflection check using a unique token
+        reflection_token = f"{marker}_REFCHK_"
+        reflection_url = build_test_url(base_url, marker, reflection_token)
+        baseline_response = send_request(session, reflection_url, headers, timeout)
+        if reflection_token not in baseline_response.text:
+            return None  # Not reflected, skip further testing
+
+        unfiltered = []
+        reflection_seen = False
+
+        for idx, char in enumerate(TEST_CHARS):
+            token = f"{marker}_T{idx}_"
+            payload = f"{token}{char}"
+            test_url = build_test_url(base_url, marker, payload)
+            response = send_request(session, test_url, headers, timeout)
+
+            if token not in response.text:
+                continue  # Payload not reflected, move on
+
+            reflection_seen = True
+
+            if was_char_reflected(response.text, token, char):
+                unfiltered.append(char)
+
+        if not reflection_seen or not unfiltered:
+            return None  # Nothing to report
+
+        # Extract parameter name
+        param_name = extract_param_name(base_url, marker)
+
+        return {
+            "url": base_url,
+            "param": param_name,
+            "chars": unfiltered,
+        }
+
+    except requests.exceptions.Timeout:
+        print(f"[!] Timeout: {base_url}", file=sys.stderr)
+    except requests.exceptions.RequestException as e:
+        print(f"[!] Error: {base_url} - {str(e)}", file=sys.stderr)
+    except Exception as e:
+        print(f"[!] Unexpected error: {str(e)}", file=sys.stderr)
+    return None
+
+
+def render_results(results, use_color):
+    """Render findings as a compact table."""
+    if not results:
+        print("No reflected payloads detected.")
+        return
+    divider = "─" * 80
+    print(divider)
+    print("Reflected Payloads")
+    print(divider)
+
+    for idx, result in enumerate(results, start=1):
+        risk = categorize_risk(result["chars"])
+        colored_risk = colorize_risk_label(risk, use_color)
+        formatted_chars = ' '.join(colorize_char(c, use_color) for c in result["chars"])
+
+        print(f"[{idx}] Risk   : {colored_risk}")
+        print(f"     Param  : {result['param']}")
+        print(f"     Chars  : {formatted_chars}")
+        print(f"     URL    : {result['url']}")
+        if idx != len(results):
+            print("-" * 80)
+
+    print(divider)
+    print(f"Total findings: {len(results)}")
+
+def main():
+    args = parse_args()
+    headers = parse_headers(args.headers)
+    use_color = not args.no_color
+    session = requests.Session()
+    
+    # Read URLs from stdin
+    if sys.stdin.isatty():
+        print("Usage: echo 'https://site.com/search?q=FUZZ' | python3 ifxss.py", file=sys.stderr)
+        print("       cat urls.txt | python3 ifxss.py -H 'Cookie: session=abc'", file=sys.stderr)
+        print("       cat urls.txt | python3 ifxss.py --no-color", file=sys.stderr)
+        sys.exit(1)
+    
+    results = []
+    tested = 0
+
+    for line in sys.stdin:
+        url = line.strip()
+        if url and url.startswith('http'):
+            tested += 1
+            finding = fuzz_url(url, args.marker, headers, args.timeout, session)
+            if finding:
+                results.append(finding)
+
+    if tested == 0:
+        print("No valid URLs supplied.", file=sys.stderr)
+        sys.exit(1)
+
+    render_results(results, use_color)
+    print(f"URLs tested: {tested}")
+
+if __name__ == '__main__':
+    main()
